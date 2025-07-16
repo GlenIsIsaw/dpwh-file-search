@@ -6,6 +6,8 @@ from flask import Flask, render_template_string, request, send_from_directory, j
 import webbrowser
 from datetime import datetime
 from math import ceil
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 app = Flask(__name__)
 
@@ -27,6 +29,33 @@ dark_mode = False
 file_cache = []
 last_cache_update = 0
 cache_lock = threading.Lock()
+app.last_cache_update = 0  # For file monitoring
+
+class FileChangeHandler(FileSystemEventHandler):
+    def __init__(self, app):
+        self.app = app
+        super().__init__()
+    
+    def on_modified(self, event):
+        if not event.is_directory:
+            ext = event.src_path.lower().split('.')[-1]
+            if ext in SUPPORTED_EXTENSIONS:
+                self.app.last_cache_update = 0
+                print(f"Detected modified file: {event.src_path}")
+    
+    def on_created(self, event):
+        if not event.is_directory:
+            ext = event.src_path.lower().split('.')[-1]
+            if ext in SUPPORTED_EXTENSIONS:
+                self.app.last_cache_update = 0
+                print(f"Detected new file: {event.src_path}")
+
+# Initialize file watcher
+event_handler = FileChangeHandler(app)
+observer = Observer()
+observer.schedule(event_handler, HOME_FOLDER, recursive=True)
+observer.daemon = True
+observer.start()
 
 def get_zip_contents(zip_path):
     """Get first 5 files from a ZIP archive"""
@@ -40,50 +69,78 @@ def update_file_cache():
     """Background thread to maintain file cache"""
     global file_cache, last_cache_update
     while True:
-        start_time = time.time()
-        new_cache = []
-        
-        try:
-            for root, _, files_in_dir in os.walk(HOME_FOLDER):
-                for file in files_in_dir:
-                    if '.' in file:
-                        ext = file.lower().split('.')[-1]
-                        if ext in SUPPORTED_EXTENSIONS:
-                            full_path = os.path.join(root, file)
-                            rel_path = os.path.relpath(full_path, HOME_FOLDER)
-                            web_path = rel_path.replace('\\', '/')
-                            
-                            try:
-                                stat = os.stat(full_path)
+        # Check if we need to update (either by timeout or forced)
+        if time.time() - last_cache_update > CACHE_EXPIRY or app.last_cache_update == 0:
+            start_time = time.time()
+            new_cache = []
+            
+            try:
+                for root, _, files_in_dir in os.walk(HOME_FOLDER):
+                    for file in files_in_dir:
+                        if '.' in file:
+                            ext = file.lower().split('.')[-1]
+                            if ext in SUPPORTED_EXTENSIONS:
+                                full_path = os.path.join(root, file)
+                                rel_path = os.path.relpath(full_path, HOME_FOLDER)
+                                web_path = rel_path.replace('\\', '/')
                                 
-                                new_cache.append({
-                                    'name': file,
-                                    'path': web_path,
-                                    'full_path': full_path,
-                                    'size': f"{stat.st_size/1024:.1f} KB",
-                                    'modified': stat.st_mtime,
-                                    'modified_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
-                                    'folder': os.path.dirname(rel_path) or '/',
-                                    'type': ext,
-                                    'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
-                                    'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
-                                })
-                            except (PermissionError, FileNotFoundError):
-                                continue
-            
-            # Sort by modified date (newest first)
-            new_cache.sort(key=lambda x: -x['modified'])
-            
-            with cache_lock:
-                file_cache = new_cache
-                last_cache_update = time.time()
+                                try:
+                                    stat = os.stat(full_path)
+                                    
+                                    # Check if file is new or modified since last scan
+                                    file_exists = False
+                                    with cache_lock:
+                                        for cached_file in file_cache:
+                                            if cached_file['full_path'] == full_path:
+                                                file_exists = True
+                                                if cached_file['modified'] < stat.st_mtime:
+                                                    # File modified - update it
+                                                    new_cache.append({
+                                                        'name': file,
+                                                        'path': web_path,
+                                                        'full_path': full_path,
+                                                        'size': f"{stat.st_size/1024:.1f} KB",
+                                                        'modified': stat.st_mtime,
+                                                        'modified_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                                                        'folder': os.path.dirname(rel_path) or '/',
+                                                        'type': ext,
+                                                        'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
+                                                        'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
+                                                    })
+                                                break
+                                    
+                                    if not file_exists:
+                                        # New file - add it
+                                        new_cache.append({
+                                            'name': file,
+                                            'path': web_path,
+                                            'full_path': full_path,
+                                            'size': f"{stat.st_size/1024:.1f} KB",
+                                            'modified': stat.st_mtime,
+                                            'modified_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                                            'folder': os.path.dirname(rel_path) or '/',
+                                            'type': ext,
+                                            'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
+                                            'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
+                                        })
+                                        
+                                except (PermissionError, FileNotFoundError):
+                                    continue
                 
-            print(f"Cache updated in {time.time()-start_time:.2f}s with {len(file_cache)} files")
-            
-        except Exception as e:
-            print(f"Cache update error: {str(e)}")
+                # Sort by modified date (newest first)
+                new_cache.sort(key=lambda x: -x['modified'])
+                
+                with cache_lock:
+                    file_cache = new_cache
+                    last_cache_update = time.time()
+                    app.last_cache_update = last_cache_update  # Reset force flag
+                
+                print(f"Cache updated in {time.time()-start_time:.2f}s with {len(file_cache)} files")
+                
+            except Exception as e:
+                print(f"Cache update error: {str(e)}")
         
-        time.sleep(CACHE_EXPIRY)
+        time.sleep(1)  # Check more frequently
 
 # Start background cache updater
 cache_thread = threading.Thread(target=update_file_cache, daemon=True)
@@ -161,6 +218,7 @@ def index():
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>DPWH Sub - DEO | Records Management Unit</title>
+            <link rel="icon" href="{{ url_for('favicon_png') }}">
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
             <style>
                 :root {
@@ -514,6 +572,52 @@ def index():
                     color: white;
                     box-shadow: 0 2px 12px rgba(124, 158, 255, 0.4);
                 }
+                                  
+                                  .pagination {
+    display: flex;
+    justify-content: center;
+    gap: 0.25rem;
+    margin-top: 2rem;
+    flex-wrap: wrap;
+}
+
+.page-link {
+    padding: 0.5rem 0.75rem;
+    min-width: 2.5rem;
+    text-align: center;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    text-decoration: none;
+    color: var(--text);
+    transition: all 0.2s;
+}
+
+.page-link:hover {
+    background-color: var(--primary-light);
+    border-color: var(--primary);
+}
+
+.page-link.active {
+    background-color: var(--primary);
+    color: white;
+    border-color: var(--primary);
+}
+
+.page-link.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    background-color: var(--card-bg);
+}
+
+@media (max-width: 768px) {
+    .pagination {
+        gap: 0.1rem;
+    }
+    .page-link {
+        padding: 0.3rem 0.5rem;
+        min-width: 2rem;
+    }
+}
                 
                 @media (max-width: 768px) {
                     .file-list {
@@ -623,29 +727,50 @@ def index():
                     {% endif %}
                 </div>
                 
-                {% if total_pages > 1 %}
-                <div class="pagination">
-                    {% if page > 1 %}
-                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page - 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Previous</a>
-                    {% else %}
-                        <span class="page-link disabled">Previous</span>
-                    {% endif %}
-                    
-                    {% for p in range(1, total_pages + 1) %}
-                        {% if p == page %}
-                            <span class="page-link active">{{ p }}</span>
-                        {% else %}
-                            <a href="?search={{ search_query }}&type={{ file_type }}&page={{ p }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ p }}</a>
-                        {% endif %}
-                    {% endfor %}
-                    
-                    {% if page < total_pages %}
-                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page + 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Next</a>
-                    {% else %}
-                        <span class="page-link disabled">Next</span>
-                    {% endif %}
-                </div>
-                {% endif %}
+           {% if total_pages > 1 %}
+<div class="pagination">
+    {% if page > 1 %}
+        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">First</a>
+        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page - 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Previous</a>
+    {% else %}
+        <span class="page-link disabled">First</span>
+        <span class="page-link disabled">Previous</span>
+    {% endif %}
+
+    {# Always show first page #}
+    {% if page > 3 %}
+        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">1</a>
+        {% if page > 4 %}
+            <span class="page-link disabled">...</span>
+        {% endif %}
+    {% endif %}
+
+    {# Show pages around current page #}
+    {% for p in range([1, page-2]|max, [page+3, total_pages + 1]|min) %}
+        {% if p == page %}
+            <span class="page-link active">{{ p }}</span>
+        {% else %}
+            <a href="?search={{ search_query }}&type={{ file_type }}&page={{ p }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ p }}</a>
+        {% endif %}
+    {% endfor %}
+
+    {# Always show last page #}
+    {% if page < total_pages - 2 %}
+        {% if page < total_pages - 3 %}
+            <span class="page-link disabled">...</span>
+        {% endif %}
+        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ total_pages }}</a>
+    {% endif %}
+
+    {% if page < total_pages %}
+        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page + 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Next</a>
+        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Last</a>
+    {% else %}
+        <span class="page-link disabled">Next</span>
+        <span class="page-link disabled">Last</span>
+    {% endif %}
+</div>
+{% endif %}
             </div>
 
                        <script>
@@ -745,9 +870,19 @@ def check_refresh():
 def serve_file(filename):
     return send_from_directory(HOME_FOLDER, filename)
 
+@app.route('/favicon.png')
+def favicon_png():
+    return send_from_directory(os.path.join(app.root_path, 'static'),
+                             'DPWH.png', mimetype='image/png')
+
 if __name__ == '__main__':
-    url = f'http://localhost:{PORT}'
-    print(f"File Finder Pro running at {url}")
-    print("Building initial file cache...")
-    webbrowser.open(url)
-    app.run(port=PORT, threaded=True)
+    try:
+        url = f'http://localhost:{PORT}'
+        print(f"File Finder Pro running at {url}")
+        print("Building initial file cache...")
+        webbrowser.open(url)
+        app.run(port=PORT, threaded=True)
+    except KeyboardInterrupt:
+        observer.stop()
+    finally:
+        observer.join()
