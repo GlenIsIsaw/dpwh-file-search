@@ -868,7 +868,11 @@ def index():
             const dateTo = dateToInput.value;
             const searchQuery = searchInput.value;
             
-            let url = `?search=${encodeURIComponent(searchQuery)}&type=${type}&page=1`;
+            // Get current page from URL or default to current page
+            const urlParams = new URLSearchParams(window.location.search);
+            const currentPage = urlParams.get('page') || {{ page }};
+            
+            let url = `?search=${encodeURIComponent(searchQuery)}&type=${type}&page=${currentPage}`;
             if (dateFrom) url += `&date_from=${dateFrom}`;
             if (dateTo) url += `&date_to=${dateTo}`;
             
@@ -900,6 +904,10 @@ def index():
                 const dateTo = dateToInput.value;
                 const fileType = '{{ file_type }}';
                 
+                // Get current page from URL or default to current page
+                const urlParams = new URLSearchParams(window.location.search);
+                const currentPage = urlParams.get('page') || {{ page }};
+                
                 // Show subtle loading indicator
                 const loadingIndicator = document.createElement('div');
                 loadingIndicator.className = 'loading-indicator';
@@ -907,8 +915,8 @@ def index():
                 loadingIndicator.textContent = 'Updating results...';
                 document.body.appendChild(loadingIndicator);
                 
-                // Build URL with current parameters
-                let url = `?search=${encodeURIComponent(searchQuery)}&type=${fileType}&page=1`;
+                // Build URL with current parameters including page
+                let url = `?search=${encodeURIComponent(searchQuery)}&type=${fileType}&page=${currentPage}`;
                 if (dateFrom) url += `&date_from=${dateFrom}`;
                 if (dateTo) url += `&date_to=${dateTo}`;
                 
@@ -937,6 +945,9 @@ def index():
                             document.querySelector('.results-count').innerHTML = newResultsCount;
                             loadingIndicator.textContent = 'Updated!';
                             setTimeout(() => loadingIndicator.remove(), 1000);
+                            
+                            // Update browser history to maintain current page
+                            window.history.pushState({}, '', url);
                         }, 200);
                     })
                     .catch(error => {
@@ -968,6 +979,11 @@ def index():
                     performSearch();
                 }
             };
+                                  
+            // Add popstate event listener to handle browser back/forward navigation
+            window.addEventListener('popstate', function() {
+                performSearch();
+            });
         }
     });
 </script>
