@@ -260,8 +260,13 @@ def index():
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>DPWH Sub - DEO | Records Management Unit</title>
             <link rel="icon" href="{{ url_for('favicon_png') }}">
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
             <style>
+                                  
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 
+                    Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+                }
+                                  
                 :root {
                     --primary: #4361ee;
                     --primary-light: #e6e9ff;
