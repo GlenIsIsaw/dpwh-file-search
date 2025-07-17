@@ -2,7 +2,7 @@ import os
 import time
 import threading
 import zipfile
-from flask import Flask, render_template_string, request, send_from_directory, jsonify
+from flask import Flask, render_template_string, request, send_from_directory, jsonify, Response
 import webbrowser
 from datetime import datetime
 from math import ceil
@@ -21,44 +21,51 @@ SUPPORTED_EXTENSIONS = {
     'xlsx': '📊 Excel',
     'zip': '🗜️ ZIP'
 }
-DEBOUNCE_DELAY = 500  # milliseconds for instant search
-CACHE_EXPIRY = 30     # seconds for auto-refresh
+DEBOUNCE_DELAY = 300
+CACHE_EXPIRY = 5
 
 # State management
 dark_mode = False
 file_cache = []
 last_cache_update = 0
 cache_lock = threading.Lock()
-app.last_cache_update = 0  # For file monitoring
+app.last_cache_update = 0
+
+# Global variables for thread management
+observer = None
+cache_thread = None
+stop_event = threading.Event()
 
 class FileChangeHandler(FileSystemEventHandler):
     def __init__(self, app):
         self.app = app
+        self.debounce_timers = {}
         super().__init__()
     
-    def on_modified(self, event):
+    def on_any_event(self, event):
         if not event.is_directory:
-            ext = event.src_path.lower().split('.')[-1]
+            ext = event.src_path.lower().split('.')[-1] if '.' in event.src_path else ''
             if ext in SUPPORTED_EXTENSIONS:
-                self.app.last_cache_update = 0
-                print(f"Detected modified file: {event.src_path}")
+                with app.app_context():
+                    app.last_cache_update = 0
+                    print(f"File change detected: {event.src_path}")  # Debug logging
+                
+                if event.src_path in self.debounce_timers:
+                    self.debounce_timers[event.src_path].cancel()
+                
+                timer = threading.Timer(0.3, self.trigger_update)
+                self.debounce_timers[event.src_path] = timer
+                timer.start()
     
-    def on_created(self, event):
-        if not event.is_directory:
-            ext = event.src_path.lower().split('.')[-1]
-            if ext in SUPPORTED_EXTENSIONS:
-                self.app.last_cache_update = 0
-                print(f"Detected new file: {event.src_path}")
-
-# Initialize file watcher
-event_handler = FileChangeHandler(app)
-observer = Observer()
-observer.schedule(event_handler, HOME_FOLDER, recursive=True)
-observer.daemon = True
-observer.start()
+    def trigger_update(self):
+        with app.app_context():
+            print("File change detected - forcing immediate cache update")
+            app.last_cache_update = 0
+            # Force cache update immediately
+            global last_cache_update
+            last_cache_update = 0
 
 def get_zip_contents(zip_path):
-    """Get first 5 files from a ZIP archive"""
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             return zip_ref.namelist()[:5]
@@ -66,85 +73,109 @@ def get_zip_contents(zip_path):
         return None
 
 def update_file_cache():
-    """Background thread to maintain file cache"""
     global file_cache, last_cache_update
-    while True:
-        # Check if we need to update (either by timeout or forced)
+    previous_files = {f['full_path']: f for f in file_cache}
+    
+    while not stop_event.is_set():
         if time.time() - last_cache_update > CACHE_EXPIRY or app.last_cache_update == 0:
             start_time = time.time()
             new_cache = []
+            files_processed = 0
+            files_updated = 0
+            current_files = set()
             
             try:
+                # First pass: collect all files
                 for root, _, files_in_dir in os.walk(HOME_FOLDER):
+                    if stop_event.is_set():
+                        break
                     for file in files_in_dir:
                         if '.' in file:
                             ext = file.lower().split('.')[-1]
                             if ext in SUPPORTED_EXTENSIONS:
                                 full_path = os.path.join(root, file)
-                                rel_path = os.path.relpath(full_path, HOME_FOLDER)
-                                web_path = rel_path.replace('\\', '/')
-                                
-                                try:
-                                    stat = os.stat(full_path)
-                                    
-                                    # Check if file is new or modified since last scan
-                                    file_exists = False
-                                    with cache_lock:
-                                        for cached_file in file_cache:
-                                            if cached_file['full_path'] == full_path:
-                                                file_exists = True
-                                                if cached_file['modified'] < stat.st_mtime:
-                                                    # File modified - update it
-                                                    new_cache.append({
-                                                        'name': file,
-                                                        'path': web_path,
-                                                        'full_path': full_path,
-                                                        'size': f"{stat.st_size/1024:.1f} KB",
-                                                        'modified': stat.st_mtime,
-                                                        'modified_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
-                                                        'folder': os.path.dirname(rel_path) or '/',
-                                                        'type': ext,
-                                                        'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
-                                                        'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
-                                                    })
-                                                break
-                                    
-                                    if not file_exists:
-                                        # New file - add it
-                                        new_cache.append({
-                                            'name': file,
-                                            'path': web_path,
-                                            'full_path': full_path,
-                                            'size': f"{stat.st_size/1024:.1f} KB",
-                                            'modified': stat.st_mtime,
-                                            'modified_str': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
-                                            'folder': os.path.dirname(rel_path) or '/',
-                                            'type': ext,
-                                            'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
-                                            'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
-                                        })
-                                        
-                                except (PermissionError, FileNotFoundError):
-                                    continue
+                                current_files.add(full_path)
                 
-                # Sort by modified date (newest first)
+                # Second pass: process files
+                for full_path in current_files:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        ext = full_path.lower().split('.')[-1]
+                        stat = os.stat(full_path)
+                        current_mtime = stat.st_mtime
+                        files_processed += 1
+                        
+                        cached_file = previous_files.get(full_path)
+                        
+                        if cached_file and cached_file['modified'] == current_mtime:
+                            new_cache.append(cached_file)
+                        else:
+                            files_updated += 1
+                            rel_path = os.path.relpath(full_path, HOME_FOLDER)
+                            web_path = rel_path.replace('\\', '/')
+                            
+                            new_cache.append({
+                                'name': os.path.basename(full_path),
+                                'path': web_path,
+                                'full_path': full_path,
+                                'size': f"{stat.st_size/1024:.1f} KB",
+                                'modified': current_mtime,
+                                'modified_str': datetime.fromtimestamp(current_mtime).strftime('%Y-%m-%d %H:%M'),
+                                'folder': os.path.dirname(rel_path) or '/',
+                                'type': ext,
+                                'icon': SUPPORTED_EXTENSIONS.get(ext, '📄'),
+                                'zip_contents': get_zip_contents(full_path) if ext == 'zip' else None
+                            })
+                            
+                    except (PermissionError, FileNotFoundError):
+                        continue
+                
                 new_cache.sort(key=lambda x: -x['modified'])
                 
                 with cache_lock:
                     file_cache = new_cache
                     last_cache_update = time.time()
-                    app.last_cache_update = last_cache_update  # Reset force flag
+                    app.last_cache_update = last_cache_update
+                    print(f"Cache updated with {len(file_cache)} files")  # Debug logging
                 
-                print(f"Cache updated in {time.time()-start_time:.2f}s with {len(file_cache)} files")
+                print(f"Cache updated in {time.time()-start_time:.2f}s - Processed: {files_processed}, Updated: {files_updated}, Total: {len(file_cache)}")
                 
             except Exception as e:
                 print(f"Cache update error: {str(e)}")
         
-        time.sleep(1)  # Check more frequently
+        time.sleep(1)
 
-# Start background cache updater
-cache_thread = threading.Thread(target=update_file_cache, daemon=True)
-cache_thread.start()
+def start_background_threads():
+    global observer, cache_thread
+    
+    # Initialize and start file observer
+    event_handler = FileChangeHandler(app)
+    observer = Observer()
+    observer.schedule(event_handler, HOME_FOLDER, recursive=True)
+    observer.start()
+    
+    # Start cache updater thread
+    cache_thread = threading.Thread(target=update_file_cache)
+    cache_thread.daemon = True
+    cache_thread.start()
+
+def stop_background_threads():
+    global observer, cache_thread
+    
+    # Signal threads to stop
+    stop_event.set()
+    
+    # Stop the observer
+    if observer:
+        observer.stop()
+        observer.join()
+    
+    # Wait for cache thread to finish
+    if cache_thread:
+        cache_thread.join(timeout=2)
+    
+    print("Background threads stopped")
 
 @app.route('/')
 def index():
@@ -154,20 +185,30 @@ def index():
     date_from = request.args.get('date_from', '')
     date_to = request.args.get('date_to', '')
     
-    if not file_cache and time.time() - last_cache_update > 5:
+    # Remove the initial loading page since we're doing background updates
+    if not file_cache:
         return render_template_string('''
             <!DOCTYPE html>
             <html>
             <head><title>Loading...</title></head>
             <body>
                 <div style="text-align: center; padding: 2rem;">
-                    <h2>Building file index...</h2>
+                    <h2>Building initial file index...</h2>
                     <p>This may take a minute for large collections</p>
-                    <p>Page will refresh automatically</p>
-                    <p>Do not interrupt</p>
                 </div>
                 <script>
-                    setTimeout(() => location.reload(), 2000);
+                    // Check every 5 seconds if we have data
+                    function checkData() {
+                        fetch('/has_data').then(response => response.json())
+                            .then(data => {
+                                if (data.has_data) {
+                                    location.reload();
+                                } else {
+                                    setTimeout(checkData, 5000);
+                                }
+                            });
+                    }
+                    setTimeout(checkData, 5000);
                 </script>
             </body>
             </html>
@@ -314,6 +355,10 @@ def index():
                     margin-bottom: 1rem;
                 }
                 
+                .search-box button {
+                    padding: 0 1rem;
+                }
+                
                 .date-range-box {
                     display: flex;
                     gap: 0.5rem;
@@ -438,6 +483,7 @@ def index():
                     grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
                     gap: 1rem;
                     margin-bottom: 2rem;
+                    transition: opacity 0.3s ease;
                 }
                 
                 .file-card {
@@ -573,51 +619,64 @@ def index():
                     box-shadow: 0 2px 12px rgba(124, 158, 255, 0.4);
                 }
                                   
-                                  .pagination {
-    display: flex;
-    justify-content: center;
-    gap: 0.25rem;
-    margin-top: 2rem;
-    flex-wrap: wrap;
-}
+                .pagination {
+                    display: flex;
+                    justify-content: center;
+                    gap: 0.25rem;
+                    margin-top: 2rem;
+                    flex-wrap: wrap;
+                }
 
-.page-link {
-    padding: 0.5rem 0.75rem;
-    min-width: 2.5rem;
-    text-align: center;
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    text-decoration: none;
-    color: var(--text);
-    transition: all 0.2s;
-}
+                .page-link {
+                    padding: 0.5rem 0.75rem;
+                    min-width: 2.5rem;
+                    text-align: center;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    text-decoration: none;
+                    color: var(--text);
+                    transition: all 0.2s;
+                }
 
-.page-link:hover {
-    background-color: var(--primary-light);
-    border-color: var(--primary);
-}
+                .page-link:hover {
+                    background-color: var(--primary-light);
+                    border-color: var(--primary);
+                }
 
-.page-link.active {
-    background-color: var(--primary);
-    color: white;
-    border-color: var(--primary);
-}
+                .page-link.active {
+                    background-color: var(--primary);
+                    color: white;
+                    border-color: var(--primary);
+                }
 
-.page-link.disabled {
-    opacity: 0.5;
-    pointer-events: none;
-    background-color: var(--card-bg);
-}
+                .page-link.disabled {
+                    opacity: 0.5;
+                    pointer-events: none;
+                    background-color: var(--card-bg);
+                }
 
-@media (max-width: 768px) {
-    .pagination {
-        gap: 0.1rem;
-    }
-    .page-link {
-        padding: 0.3rem 0.5rem;
-        min-width: 2rem;
-    }
-}
+                .loading-indicator {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: var(--primary);
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 20px;
+                    z-index: 1000;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                    transition: all 0.3s ease;
+                }
+
+                @media (max-width: 768px) {
+                    .pagination {
+                        gap: 0.1rem;
+                    }
+                    .page-link {
+                        padding: 0.3rem 0.5rem;
+                        min-width: 2rem;
+                    }
+                }
                 
                 @media (max-width: 768px) {
                     .file-list {
@@ -636,6 +695,15 @@ def index():
                         flex-direction: column;
                         align-items: flex-start;
                     }
+                    
+                    .search-box {
+                        flex-direction: column;
+                    }
+                    
+                    .search-box button {
+                        width: 100%;
+                        margin-top: 0.5rem;
+                    }
                 }
             </style>
         </head>
@@ -649,9 +717,9 @@ def index():
                                 <p class="subtitle">Search files by name, folder, date, or type</p>
                             </div>
                         </div>
-                        <button onclick="toggleDarkMode()" class="dark-mode-toggle">
-                            {{ '☀️ Light Mode' if dark_mode else '🌙 Dark Mode' }}
-                        </button>
+            <button onclick="toggleDarkMode()" class="dark-mode-toggle">
+    {{ '☀️ Light Mode' if dark_mode else '🌙 Dark Mode' }}
+</button>
                     </div>
                 </header>
                 
@@ -659,6 +727,7 @@ def index():
                     <div class="search-box">
                         <input type="text" id="search-input" placeholder="Automatically search files, date, or folders..." 
                                value="{{ search_query }}" autofocus>
+                                   <button id="search-button">Search</button>
                     </div>
                     <div class="date-range-box">
                         <input type="date" id="date-from" name="date_from" value="{{ date_from }}"
@@ -666,20 +735,20 @@ def index():
                         <span>to</span>
                         <input type="date" id="date-to" name="date_to" value="{{ date_to }}"
                                placeholder="To date">
-                        <button onclick="resetDates()" class="date-reset-btn" type="button">
-                            Reset
-                        </button>
+                    <button onclick="resetDates()" class="date-reset-btn" type="button">
+                        Reset
+                    </button>
                     </div>
-                    <div class="filter-box">
-                        <a href="javascript:void(0)" onclick="setFileType('all')" 
-                           class="filter-btn {% if file_type == 'all' %}active{% endif %}">All Files</a>
-                        {% for ext, label in SUPPORTED_EXTENSIONS.items() %}
-                            <a href="javascript:void(0)" onclick="setFileType('{{ ext }}')" 
-                               class="filter-btn {% if file_type == ext %}active{% endif %}">
-                                {{ label }}
-                            </a>
-                        {% endfor %}
-                    </div>
+ <div class="filter-box">
+    <a href="javascript:void(0)" onclick="setFileType('all')" 
+       class="filter-btn {% if file_type == 'all' %}active{% endif %}">All Files</a>
+    {% for ext, label in SUPPORTED_EXTENSIONS.items() %}
+        <a href="javascript:void(0)" onclick="setFileType('{{ ext }}')" 
+           class="filter-btn {% if file_type == ext %}active{% endif %}">
+            {{ label }}
+        </a>
+    {% endfor %}
+</div>
                     <div class="results-count">
                         Found {{ total_files }} file{% if total_files != 1 %}s{% endif %}
                         {% if file_type != 'all' %} ({{ SUPPORTED_EXTENSIONS.get(file_type, '') }}){% endif %}
@@ -689,7 +758,7 @@ def index():
                     </div>
                 </div>
                 
-                <div class="file-list">
+                <div class="file-list" id="file-list-container">
                     {% if not paginated_files %}
                         <div class="no-results">
                             <p>No files found{% if search_query %} matching "{{ search_query }}"{% endif %}</p>
@@ -700,7 +769,7 @@ def index():
                         </div>
                     {% else %}
                         {% for file in paginated_files %}
-                            <div class="file-card">
+                            <div class="file-card" data-file-path="{{ file.path }}">
                                 <a href="/file/{{ file.path }}" class="file-name" target="_blank">
                                     <span class="file-icon">{{ file.icon }}</span>{{ file.name }}
                                 </a>
@@ -727,115 +796,181 @@ def index():
                     {% endif %}
                 </div>
                 
-           {% if total_pages > 1 %}
-<div class="pagination">
-    {% if page > 1 %}
-        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">First</a>
-        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page - 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Previous</a>
-    {% else %}
-        <span class="page-link disabled">First</span>
-        <span class="page-link disabled">Previous</span>
-    {% endif %}
+                {% if total_pages > 1 %}
+                <div class="pagination">
+                    {% if page > 1 %}
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">First</a>
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page - 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Previous</a>
+                    {% else %}
+                        <span class="page-link disabled">First</span>
+                        <span class="page-link disabled">Previous</span>
+                    {% endif %}
 
-    {# Always show first page #}
-    {% if page > 3 %}
-        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">1</a>
-        {% if page > 4 %}
-            <span class="page-link disabled">...</span>
-        {% endif %}
-    {% endif %}
+                    {# Always show first page #}
+                    {% if page > 3 %}
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page=1&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">1</a>
+                        {% if page > 4 %}
+                            <span class="page-link disabled">...</span>
+                        {% endif %}
+                    {% endif %}
 
-    {# Show pages around current page #}
-    {% for p in range([1, page-2]|max, [page+3, total_pages + 1]|min) %}
-        {% if p == page %}
-            <span class="page-link active">{{ p }}</span>
-        {% else %}
-            <a href="?search={{ search_query }}&type={{ file_type }}&page={{ p }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ p }}</a>
-        {% endif %}
-    {% endfor %}
+                    {# Show pages around current page #}
+                    {% for p in range([1, page-2]|max, [page+3, total_pages + 1]|min) %}
+                        {% if p == page %}
+                            <span class="page-link active">{{ p }}</span>
+                        {% else %}
+                            <a href="?search={{ search_query }}&type={{ file_type }}&page={{ p }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ p }}</a>
+                        {% endif %}
+                    {% endfor %}
 
-    {# Always show last page #}
-    {% if page < total_pages - 2 %}
-        {% if page < total_pages - 3 %}
-            <span class="page-link disabled">...</span>
-        {% endif %}
-        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ total_pages }}</a>
-    {% endif %}
+                    {# Always show last page #}
+                    {% if page < total_pages - 2 %}
+                        {% if page < total_pages - 3 %}
+                            <span class="page-link disabled">...</span>
+                        {% endif %}
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">{{ total_pages }}</a>
+                    {% endif %}
 
-    {% if page < total_pages %}
-        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page + 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Next</a>
-        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Last</a>
-    {% else %}
-        <span class="page-link disabled">Next</span>
-        <span class="page-link disabled">Last</span>
-    {% endif %}
-</div>
-{% endif %}
+                    {% if page < total_pages %}
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ page + 1 }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Next</a>
+                        <a href="?search={{ search_query }}&type={{ file_type }}&page={{ total_pages }}&date_from={{ date_from }}&date_to={{ date_to }}" class="page-link">Last</a>
+                    {% else %}
+                        <span class="page-link disabled">Next</span>
+                        <span class="page-link disabled">Last</span>
+                    {% endif %}
+                </div>
+                {% endif %}
             </div>
 
-                       <script>
-                // ⚡ Instant Search (Debounced Typing)
-                let searchTimer;
-                const searchInput = document.getElementById('search-input');
-                const dateFromInput = document.getElementById('date-from');
-                const dateToInput = document.getElementById('date-to');
+          <script>
+    // Global variables
+    let performSearch; // Declare the function variable globally
+
+    // Global functions
+    function resetDates() {
+        const dateFromInput = document.getElementById('date-from');
+        const dateToInput = document.getElementById('date-to');
+        if (dateFromInput && dateToInput) {
+            dateFromInput.value = '';
+            dateToInput.value = '';
+            if (typeof performSearch === 'function') {
+                performSearch();
+            }
+        }
+    }
+
+    function setFileType(type) {
+        const dateFromInput = document.getElementById('date-from');
+        const dateToInput = document.getElementById('date-to');
+        const searchInput = document.getElementById('search-input');
+        if (dateFromInput && dateToInput && searchInput) {
+            const dateFrom = dateFromInput.value;
+            const dateTo = dateToInput.value;
+            const searchQuery = searchInput.value;
+            
+            let url = `?search=${encodeURIComponent(searchQuery)}&type=${type}&page=1`;
+            if (dateFrom) url += `&date_from=${dateFrom}`;
+            if (dateTo) url += `&date_to=${dateTo}`;
+            
+            window.location.href = url;
+        }
+    }
+
+    function toggleDarkMode() {
+        fetch('/toggle_dark_mode').then(() => location.reload());
+    }
+
+    // Wait for DOM to be fully loaded before executing JavaScript
+    document.addEventListener('DOMContentLoaded', function() {
+        // ⚡ Instant Search (Debounced Typing)
+        let searchTimer;
+        const searchInput = document.getElementById('search-input');
+        const dateFromInput = document.getElementById('date-from');
+        const dateToInput = document.getElementById('date-to');
+        const searchButton = document.getElementById('search-button');
+        const fileListContainer = document.getElementById('file-list-container');
+        let lastTypingTime = 0;
+        
+        // Only proceed if all required elements exist
+        if (searchInput && dateFromInput && dateToInput && searchButton && fileListContainer) {
+            // Define performSearch function and assign it to the global variable
+            performSearch = function() {
+                const searchQuery = searchInput.value.trim().toLowerCase();
+                const dateFrom = dateFromInput.value;
+                const dateTo = dateToInput.value;
+                const fileType = '{{ file_type }}';
                 
-                // Set up event listeners
-                searchInput.addEventListener('input', function() {
-                    clearTimeout(searchTimer);
-                    searchTimer = setTimeout(() => {
-                        performSearch();
-                    }, {{ DEBOUNCE_DELAY }});
-                });
+                // Show subtle loading indicator
+                const loadingIndicator = document.createElement('div');
+                loadingIndicator.className = 'loading-indicator';
+                loadingIndicator.style = 'position: fixed; bottom: 20px; right: 20px; background: var(--primary); color: white; padding: 8px 16px; border-radius: 20px; z-index: 1000;';
+                loadingIndicator.textContent = 'Updating results...';
+                document.body.appendChild(loadingIndicator);
                 
-                // Add change listeners for date inputs
-                dateFromInput.addEventListener('change', performSearch);
-                dateToInput.addEventListener('change', performSearch);
+                // Build URL with current parameters
+                let url = `?search=${encodeURIComponent(searchQuery)}&type=${fileType}&page=1`;
+                if (dateFrom) url += `&date_from=${dateFrom}`;
+                if (dateTo) url += `&date_to=${dateTo}`;
                 
-                function performSearch() {
-                    const searchQuery = searchInput.value;
-                    const dateFrom = dateFromInput.value;
-                    const dateTo = dateToInput.value;
-                    
-                    let url = `?search=${encodeURIComponent(searchQuery)}&type={{ file_type }}&page=1`;
-                    if (dateFrom) url += `&date_from=${dateFrom}`;
-                    if (dateTo) url += `&date_to=${dateTo}`;
-                    
-                    window.location.href = url;
-                }
-                
-                function setFileType(type) {
-                    const dateFrom = dateFromInput.value;
-                    const dateTo = dateToInput.value;
-                    
-                    let url = `?search={{ search_query }}&type=${type}&page=1`;
-                    if (dateFrom) url += `&date_from=${dateFrom}`;
-                    if (dateTo) url += `&date_to=${dateTo}`;
-                    
-                    window.location.href = url;
-                }
-                
-                // Date range reset
-                function resetDates() {
-                    dateFromInput.value = '';
-                    dateToInput.value = '';
+                // Use fetch API to get updated results without full page reload
+                fetch(url)
+                    .then(response => response.text())
+                    .then(html => {
+                        // Parse the HTML response
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        const newContent = doc.querySelector('.file-list').innerHTML;
+                        const newPagination = doc.querySelector('.pagination')?.innerHTML || '';
+                        const newResultsCount = doc.querySelector('.results-count').innerHTML;
+                        
+                        // Update the page content smoothly
+                        fileListContainer.style.opacity = '0.8';
+                        setTimeout(() => {
+                            fileListContainer.innerHTML = newContent;
+                            fileListContainer.style.opacity = '1';
+                            if (newPagination) {
+                                const paginationDiv = document.querySelector('.pagination');
+                                if (paginationDiv) {
+                                    paginationDiv.innerHTML = newPagination;
+                                }
+                            }
+                            document.querySelector('.results-count').innerHTML = newResultsCount;
+                            loadingIndicator.textContent = 'Updated!';
+                            setTimeout(() => loadingIndicator.remove(), 1000);
+                        }, 200);
+                    })
+                    .catch(error => {
+                        console.error('Search error:', error);
+                        loadingIndicator.textContent = 'Update failed';
+                        setTimeout(() => loadingIndicator.remove(), 2000);
+                    });
+            };
+            
+            // Set up event listeners with optimized debouncing
+            searchInput.addEventListener('input', function() {
+                lastTypingTime = Date.now();
+                clearTimeout(searchTimer);
+                searchTimer = setTimeout(performSearch, {{ DEBOUNCE_DELAY }});
+            });
+            
+            searchButton.addEventListener('click', performSearch);
+            
+            // Add change listeners for date inputs
+            dateFromInput.addEventListener('change', performSearch);
+            dateToInput.addEventListener('change', performSearch);
+            
+            // 🔄 Real-time updates with Server-Sent Events
+            const eventSource = new EventSource('/updates');
+            eventSource.onmessage = function(e) {
+                console.log('File system update detected');
+                // Only refresh if we're not currently typing
+                if (!searchInput.value || Date.now() - lastTypingTime > 5000) {
                     performSearch();
                 }
-                
-                // 🎨 Dark Mode Toggle
-                function toggleDarkMode() {
-                    fetch('/toggle_dark_mode').then(() => location.reload());
-                }
-                
-                // 🔄 Background Auto-Refresh
-                setInterval(() => {
-                    fetch('/check_refresh').then(res => res.json()).then(data => {
-                        if (data.needs_refresh) {
-                            location.reload();
-                        }
-                    });
-                }, 30000);
-            </script>
+            };
+        }
+    });
+</script>
         </body>
         </html>
     ''', 
@@ -860,11 +995,25 @@ def toggle_dark_mode():
     dark_mode = not dark_mode
     return jsonify({"dark_mode": dark_mode})
 
-@app.route('/check_refresh')
-def check_refresh():
-    global last_cache_update
-    needs_refresh = (time.time() - last_cache_update) > CACHE_EXPIRY
-    return jsonify({"needs_refresh": needs_refresh})
+@app.route('/has_data')
+def has_data():
+    return jsonify({'has_data': len(file_cache) > 0})
+
+@app.route('/updates')
+def updates():
+    def event_stream():
+        last_version = app.last_cache_update
+        last_file_count = len(file_cache)
+        while True:
+            # Check if cache was updated or file count changed significantly
+            current_file_count = len(file_cache)
+            if app.last_cache_update > last_version or abs(current_file_count - last_file_count) > 5:
+                last_version = app.last_cache_update
+                last_file_count = current_file_count
+                yield f"data: {last_version}\n\n"
+            time.sleep(1)  # Check more frequently but only send updates when needed
+    
+    return Response(event_stream(), mimetype="text/event-stream")
 
 @app.route('/file/<path:filename>')
 def serve_file(filename):
@@ -877,12 +1026,19 @@ def favicon_png():
 
 if __name__ == '__main__':
     try:
+        start_background_threads()
+        
         url = f'http://localhost:{PORT}'
         print(f"File Finder Pro running at {url}")
         print("Building initial file cache...")
         webbrowser.open(url)
+        
         app.run(port=PORT, threaded=True)
+        
     except KeyboardInterrupt:
-        observer.stop()
+        print("\nShutting down gracefully...")
+    except Exception as e:
+        print(f"Error: {str(e)}")
     finally:
-        observer.join()
+        stop_background_threads()
+        print("Cleanup complete. You can now safely close VS Code.")
